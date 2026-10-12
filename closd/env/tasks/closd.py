@@ -170,6 +170,7 @@ class CLoSD(humanoid_im.HumanoidIm):
             self.max_episode_length = self.max_episode_length + self.prefix_crop_size  # FIXME: it is bad practice to overide a global variable. better use a different name
             self.save_name_suffix = self.cfg['env']['save_motion']['save_name_suffix']
             self.done_saving_episodes = False  # FIXME: convert to a boolean in the base class, saying "task_done"
+            self.n_terminated_episodes = 0  # episodes that ended in a termination, which are not saved
 
             # prepare buffers where episode data will be stored. Use PHC format to make all conversions together at the end only
             self.episode_buf = torch.empty([self.num_envs,                self.max_episode_length, 24, 3], dtype=torch.float32, device=self.device)
@@ -444,6 +445,7 @@ class CLoSD(humanoid_im.HumanoidIm):
         self._update_pose_buffer()
         self.frame_idx += 1
         if self.save_hml_episodes and self.n_all_episodes < self.max_saved_hml_episodes:
+            self.n_terminated_episodes += int(self._terminate_buf.sum())
             env_ids = self.get_episode_ids()
             self.aggregate_episodes(env_ids)
             if self.n_all_episodes == self.max_saved_hml_episodes:
@@ -458,6 +460,8 @@ class CLoSD(humanoid_im.HumanoidIm):
         hml_motions = hml_motions.unsqueeze(2).permute(0, 3, 2, 1)  # [bs, 263, 1, max_episode_len@20fps]
             
         data_to_save = {'motion': hml_motions.squeeze().permute(0, 2, 1),  # use the same format used for evaluation
+                        'body_pos': self.all_episodes[:self.n_all_episodes].clone(),  # the simulated bodies themselves, [episodes, steps@30fps, 24, 3]
+                        'terminated_episodes': self.n_terminated_episodes,
                         'caption': self.all_episodes_prompts[:self.n_all_episodes], 
                         'length': self.all_episodes_lengths[:self.n_all_episodes], 
                         'tokens': self.all_episodes_tokens[:self.n_all_episodes],
