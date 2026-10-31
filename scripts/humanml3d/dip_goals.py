@@ -19,7 +19,9 @@ window is
     out  the item's one goal at the motion's last frame, in every window.
 The goal joints are eval_goals.py's bodies of the SMPL humanoid by their HumanML3D joints: the pelvis, the wrists and
 the feet (HumanML3D's foot joints, the toes). Writes HumanML3D's features of the 9 s, history included, normalized by
-its Mean.npy and Std.npy, with the goals given and every item's length, for eval_goals.py.
+its Mean.npy and Std.npy, with the goals given and every item's length, key, caption and tokens, so that both
+eval_goals.py and eval_t2m.py score them: the in-horizon episodes are DiP's row of the benchmark's text-to-motion table
+(experiment1/humanml3d/README.md of mvp-prior2policy).
 """
 import argparse
 import pickle
@@ -88,7 +90,7 @@ def main():
     else:
         frame, body = goals["out_frame"][:, None].expand(-1, WINDOWS), goals["out_body"][:, None].expand(-1, WINDOWS)
 
-    episodes = []
+    episodes, captions, tokens = [], [], []
     for start in tqdm(range(0, count, ours.batch_size)):
         items = list(range(start, min(start + ours.batch_size, count)))
         bs = len(items)
@@ -97,6 +99,8 @@ def main():
                                 for i in items]).float().to(device)  # [bs, 180, 263], the last frame held
         world = recover_from_ric(recorded, 22)  # [bs, 180, 22, 3], the joints of the recorded motion
         text = [test["captions"][i][goals["caption"][i]]["text"] for i in items]
+        captions += text
+        tokens += ["_".join(["sos/OTHER"] + test["captions"][i][goals["caption"][i]]["tokens"] + ["eos/OTHER"]) for i in items]
         text_embed = model.encode_text(text)
         motion = recorded[:, :HISTORY]
         rows = torch.arange(bs, device=device)
@@ -130,7 +134,8 @@ def main():
         episodes.append(((motion - mean) / std).cpu())
     ours.out.parent.mkdir(parents=True, exist_ok=True)
     with open(ours.out, "wb") as file:
-        pickle.dump(dict(motion=torch.cat(episodes), goals=ours.goals, length=goals["length"].tolist()), file, protocol=4)
+        pickle.dump(dict(motion=torch.cat(episodes), goals=ours.goals, length=goals["length"].tolist(), caption=captions,
+                         tokens=tokens, db_key=list(test["key"])), file, protocol=4)
     print(f"{count} episodes of {FRAMES} frames, {ours.goals}-horizon goals: {ours.out}")
 
 
