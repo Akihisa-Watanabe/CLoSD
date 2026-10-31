@@ -1,0 +1,8 @@
+defaults:
+  - closd_base
+
+task: CLoSDGoals  # ARDY's Table 5 with in-horizon goals, closd/env/tasks/closd_goals.py
+episode_length: 241  # the start and 240 control steps, four windows of 2 s
+enableEarlyTermination: False  # every episode runs its 8 s; the scorers leave out the falls
+prior2policy: null  # the mvp-prior2policy repository: its test items, their goals and its humanoid
+out: null  # the episodes (.npz)
