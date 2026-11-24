@@ -18,7 +18,14 @@ is off, so that every episode runs its 8 s; whether CLoSD's own rule would have 
 Writes an .npz of body_pos (items, 270, 24, 3), the recorded second brought to 30 steps as CLoSD brings its plans and
 the 240 control steps behind it, the bodies z up in the humanoid's order; fps; goals ("in"); and every item's length,
 key and caption, in the order of the test items, with terminated (items,).
+
+With env=closd_caption (caption_only), the same for Experiment 2, the caption alone, as mvp-prior2policy's
+eval/humanml3d/policy_t2m.py --protocol recorded plays its policy: a world starts at the item's recorded state at the end
+of its first 2 s, the no-target DiP plans the four windows behind it without goals, the first from the recorded second
+second, under the caption the baselines draw (mvp-prior2policy's utils/humanml3d.py, prompts), and body_pos holds the
+recorded 2 s, brought to 60 steps, in front of the 240 control steps (items, 300, 24, 3), without goals and lengths.
 """
+import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -34,7 +41,7 @@ from closd.utils import torch_utils
 from closd.utils.closd_util import STATES
 from closd.utils.poselib.poselib.skeleton.skeleton3d import SkeletonMotion, SkeletonState
 
-HISTORY, WINDOWS, FPS = 20, 4, 20  # the recorded second and the windows of 2 s, at HumanML3D's frame rate
+CONTEXT, WINDOWS, FPS = 20, 4, 20  # DiP's context, a second, and the windows of 2 s, at HumanML3D's frame rate
 GOAL_JOINT = {"Pelvis": "pelvis", "L_Wrist": "left_wrist", "R_Wrist": "right_wrist", "L_Toe": "left_foot", "R_Toe": "right_foot"}
 FACING = {"R_Hip": 2, "L_Hip": 1, "R_Shoulder": 17, "L_Shoulder": 16}  # the bodies a heading is read from, and their HumanML3D joints
 
@@ -70,15 +77,22 @@ class CLoSDGoals(closd_task.CLoSDTask):
         root, self.out = Path(cfg["env"]["prior2policy"]), Path(cfg["env"]["out"])
         test = torch.load(root / "data/humanml3d_test.pt")
         goals = torch.load(root / "data/humanml3d_goals.pt")
-        self.key, self.caption, self.length = np.array(goals["key"]), goals["caption"].numpy(), goals["length"].numpy()
+        self.caption_only = cfg["env"]["caption_only"]
+        self.key, self.length = np.array(goals["key"]), goals["length"].numpy()
+        if self.caption_only:  # the baselines' draw, one caption per item with a fixed seed
+            rng = random.Random(0)
+            self.caption = np.array([rng.randrange(len(captions)) for captions in test["captions"]])
+        else:
+            self.caption = goals["caption"].numpy()
         self.prompts = [test["captions"][i][c]["text"] for i, c in enumerate(self.caption.tolist())]
         count = len(self.prompts)
-        recorded = torch.stack([motion[:HISTORY] for motion in test["motion"]]).float().to(self.device)
+        start_frame = 2 * FPS if self.caption_only else FPS  # the recorded frames in front of the episode
+        recorded = torch.stack([motion[start_frame - CONTEXT:start_frame] for motion in test["motion"]]).float().to(self.device)
         self.prefix = (recorded - self.mean) / self.std  # [items, 20, 263], the first window's context
-        self.history = self.rep.fps_convert(goals["body_pos"][:, :HISTORY].to(self.device), FPS, 30)  # [items, 30, 24, 3]
+        self.history = self.rep.fps_convert(goals["body_pos"][:, :start_frame].to(self.device), FPS, 30)  # [items, 30 or 60, 24, 3]
         bodies = mjcf_bodies(root / "assets/smpl_humanoid.xml")
         orders = ["".join("XYZ"[[float(a) for a in joint.get("axis").split()].index(1)] for joint in body.findall("joint")) for body in bodies[1:]]
-        start = start_states(goals["qpos"][:, HISTORY - 2:HISTORY + 1], orders, self.skeleton_trees[0])
+        start = start_states(goals["qpos"][:, start_frame - 2:start_frame + 1], orders, self.skeleton_trees[0])
         self.start = {name: value.to(self.device) for name, value in start.items()}
         ended = goals["in_frame"] < 0  # a window's goal; where the motion has ended, its last frame's
         frame = torch.where(ended, goals["out_frame"][:, None], goals["in_frame"])
@@ -98,7 +112,7 @@ class CLoSDGoals(closd_task.CLoSDTask):
     def _reset_envs(self, env_ids):
         if len(env_ids) > 0:
             self.item[env_ids] = (self.round * self.num_envs + env_ids) % len(self.prompts)
-            self.pose_buffer[env_ids] = self.history[self.item[env_ids]]
+            self.pose_buffer[env_ids] = self.history[self.item[env_ids], -self.context_len_30fps:]
             self.terminated[env_ids] = False
         # CLoSD's own fills the context with the bodies as they are and replaces the first plan by them
         super(closd.CLoSD, self)._reset_envs(env_ids)
@@ -115,7 +129,19 @@ class CLoSDGoals(closd_task.CLoSDTask):
         for env, item in zip(env_ids.tolist(), self.item[env_ids].tolist()):
             self.hml_prompts[env] = self.prompts[item]
 
+    def get_cur_done(self):
+        if self.caption_only:  # no target to reach, as in CLoSD's text-to-motion (closd_t2m.py)
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        return super().get_cur_done()
+
     def build_completion_input(self, context_switch_vec=None):
+        if self.caption_only:
+            context, _, recon_data = self.rep.pose_to_hml(self.pose_buffer, None, fix_ik_bug=True)
+            first = self.progress_buf < self.planning_horizon_30fps
+            context[first] = self.prefix[self.item[first]]
+            return dict(mask=torch.ones(self.num_envs, 1, 1, self.max_frame_20fps, dtype=torch.bool, device=self.mdm_device),
+                        prefix_len=self.context_len_20fps, prefix=context.permute(0, 2, 1).unsqueeze(2),
+                        scale=torch.full((self.num_envs,), self.mdm_cfg_param, device=self.mdm_device)), recon_data
         window = (self.progress_buf // self.planning_horizon_30fps).clamp(max=WINDOWS - 1)
         rows = torch.arange(self.num_envs, device=self.device)
         points = torch.cat([self.goal_pos[self.item, window][:, None], self.goal_facing[self.item, window]], 1)  # the goal, the facing bodies
@@ -159,7 +185,8 @@ class CLoSDGoals(closd_task.CLoSDTask):
         print(f"{min(self.round * self.num_envs, count)} of {count} items", flush=True)
         if self.round * self.num_envs >= count:
             self.out.parent.mkdir(parents=True, exist_ok=True)
-            np.savez(self.out, body_pos=self.episodes.numpy(), fps=30., goals="in", length=self.length, key=self.key,
-                     caption=self.caption, terminated=self.episode_terminated.numpy())
+            goals = {} if self.caption_only else dict(goals="in", length=self.length)
+            np.savez(self.out, body_pos=self.episodes.numpy(), fps=30., key=self.key, caption=self.caption,
+                     terminated=self.episode_terminated.numpy(), **goals)
             print(f"{count} episodes, {int(self.episode_terminated.sum())} that CLoSD would have terminated: {self.out}", flush=True)
             self.done_saving_episodes = True

@@ -1,0 +1,7 @@
+defaults:
+  - closd_goals
+
+caption_only: True  # Experiment 2, the caption alone behind the item's first 2 s (closd/env/tasks/closd_goals.py)
+dip:  # closd_t2m.yaml's planner, without goals
+  model_path: closd/diffusion_planner/save/DiP_no-target_10steps_context20_predict40/model000200000.pt
+  cfg_param: 5

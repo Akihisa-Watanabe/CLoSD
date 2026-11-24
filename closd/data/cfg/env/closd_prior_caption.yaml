@@ -1,0 +1,5 @@
+defaults:
+  - closd_caption
+
+task: CLoSDPrior  # mvp-prior2policy's prior planning for CLoSD's tracker on Experiment 2 (closd/env/tasks/closd_prior.py)
+plan_frames: 2  # the frames the prior plans at a decision: 2 as the policy decides, 40 as CLoSD plans (closd_prior.py)
