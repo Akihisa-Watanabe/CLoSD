@@ -9,11 +9,11 @@ world w of round r performs item r * num_envs + w. A world starts at the item's 
 second, the humanoid's pose at the second's last frame (20 fps) with its velocities from the frames around it, as PHC's
 motion library gives a reference state. DiP plans the four windows of 2 s behind it under the item's caption, as CLoSD
 plans (closd.py): the first window from the recorded second, HumanML3D's features of the item, and the others from the
-last second the simulator ran; the tracker follows each plan for 60 control steps. A window's goal is given as
-scripts/humanml3d/dip_goals.py gives DiP its goals: the position of the goal's joint at the window's last frame, read
-from the item's recorded motion on the humanoid, in the frame of the window's first frame, by the position alone; where
-the motion has ended before the window does, its last frame's goal. Early termination is off, so that every episode runs
-its 8 s; whether CLoSD's own rule would have terminated it is recorded beside it.
+last second the simulator ran; the tracker follows each plan for 60 control steps. A window's goal is given as DiP was
+trained on one, and as scripts/humanml3d/dip_goals.py --heading gives DiP its goals: the position of the goal's joint at
+the window's last frame with the body's heading there, read from the item's recorded motion on the humanoid, in the frame
+of the window's first frame; where the motion has ended before the window does, its last frame's goal. Early termination
+is off, so that every episode runs its 8 s; whether CLoSD's own rule would have terminated it is recorded beside it.
 
 Writes an .npz of body_pos (items, 270, 24, 3), the recorded second brought to 30 steps as CLoSD brings its plans and
 the 240 control steps behind it, the bodies z up in the humanoid's order; fps; goals ("in"); and every item's length,
@@ -27,7 +27,7 @@ import torch
 from scipy.spatial.transform import Rotation
 
 from closd.diffusion_planner.data_loaders.humanml.common.quaternion import qinv, qrot
-from closd.diffusion_planner.data_loaders.humanml.scripts.motion_process import recover_root_rot_pos
+from closd.diffusion_planner.data_loaders.humanml.scripts.motion_process import recover_root_rot_heading_ang, recover_root_rot_pos
 from closd.env.tasks import closd, closd_task
 from closd.env.tasks.humanoid import compute_humanoid_reset
 from closd.utils import torch_utils
@@ -36,6 +36,7 @@ from closd.utils.poselib.poselib.skeleton.skeleton3d import SkeletonMotion, Skel
 
 HISTORY, WINDOWS, FPS = 20, 4, 20  # the recorded second and the windows of 2 s, at HumanML3D's frame rate
 GOAL_JOINT = {"Pelvis": "pelvis", "L_Wrist": "left_wrist", "R_Wrist": "right_wrist", "L_Toe": "left_foot", "R_Toe": "right_foot"}
+FACING = {"R_Hip": 2, "L_Hip": 1, "R_Shoulder": 17, "L_Shoulder": 16}  # the bodies a heading is read from, and their HumanML3D joints
 
 
 def mjcf_bodies(mjcf):
@@ -83,6 +84,8 @@ class CLoSDGoals(closd_task.CLoSDTask):
         frame = torch.where(ended, goals["out_frame"][:, None], goals["in_frame"])
         body = torch.where(ended, goals["out_body"][:, None], goals["in_body"])
         self.goal_pos = goals["body_pos"][torch.arange(count)[:, None], frame, body].to(self.device)  # [items, 4, 3]
+        facing = [[b.get("name") for b in bodies].index(name) for name in FACING]
+        self.goal_facing = goals["body_pos"][torch.arange(count)[:, None], frame][:, :, facing].to(self.device)  # [items, 4, 4, 3]
         self.goal_joint = [[GOAL_JOINT[bodies[b].get("name")] for b in item] for item in body.tolist()]
 
         self.item = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -115,22 +118,27 @@ class CLoSDGoals(closd_task.CLoSDTask):
     def build_completion_input(self, context_switch_vec=None):
         window = (self.progress_buf // self.planning_horizon_30fps).clamp(max=WINDOWS - 1)
         rows = torch.arange(self.num_envs, device=self.device)
-        context, goal, recon_data = self.rep.pose_to_hml(self.pose_buffer, self.goal_pos[self.item, window][:, None], fix_ik_bug=True)
+        points = torch.cat([self.goal_pos[self.item, window][:, None], self.goal_facing[self.item, window]], 1)  # the goal, the facing bodies
+        context, points, recon_data = self.rep.pose_to_hml(self.pose_buffer, points, fix_ik_bug=True)
         first = self.progress_buf < self.planning_horizon_30fps
         context[first] = self.prefix[self.item[first]]
-        # the goal from the frame of the context's last frame, where the plan is placed, to that of the window's first frame
+        # the points from the frame of the context's last frame, where the plan is placed, to that of the window's first frame
         quat, pos = recover_root_rot_pos(torch.cat([context, context[:, -1:]], 1) * self.std + self.mean)
         xz = torch.tensor([1., 0., 1.], device=self.device)
-        goal = qrot(qinv(quat[:, -2]), goal[:, 0]) + pos[:, -2] * xz
-        goal = qrot(quat[:, -1], goal - pos[:, -1] * xz)
+        turn = lambda q: q[:, None].expand(-1, points.shape[1], -1).contiguous()
+        points = qrot(turn(qinv(quat[:, -2])), points) + (pos[:, -2] * xz)[:, None]
+        points = qrot(turn(quat[:, -1]), points - (pos[:, -1] * xz)[:, None])
+        joints = torch.zeros(self.num_envs, 22, 3, 1, device=self.device)
+        joints[:, list(FACING.values()), :, 0] = points[:, 1:]
         names = [self.goal_joint[item][k] for item, k in zip(self.item.tolist(), window.tolist())]
         target = torch.zeros(self.num_envs, self.num_joint_conditions, 3, device=self.device)
-        target[rows, torch.tensor([self.extended_goal_joint_names.index(name) for name in names], device=self.device)] = goal
+        target[rows, torch.tensor([self.extended_goal_joint_names.index(name) for name in names], device=self.device)] = points[:, 0]
+        target[:, self.extended_goal_joint_names.index("heading"), 0] = recover_root_rot_heading_ang(joints)[:, 0, 0]
         aux_entries = dict(mask=torch.ones(self.num_envs, 1, 1, self.max_frame_20fps, dtype=torch.bool, device=self.mdm_device),
                            prefix_len=self.context_len_20fps, prefix=context.permute(0, 2, 1).unsqueeze(2),
                            scale=torch.full((self.num_envs,), self.mdm_cfg_param, device=self.mdm_device),
                            target_cond=target, target_joint_names=[[name] for name in names],
-                           is_heading=torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+                           is_heading=torch.ones(self.num_envs, dtype=torch.bool, device=self.device))
         return aux_entries, recon_data
 
     def post_physics_step(self):
